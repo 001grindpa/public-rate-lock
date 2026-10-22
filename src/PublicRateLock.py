@@ -16,11 +16,8 @@ ZERO = Address("0x0000000000000000000000000000000000000000")
 
 ALLOWED_HOSTS = (
     "federalreserve.gov",
-    "www.federalreserve.gov",
     "bankofengland.co.uk",
-    "www.bankofengland.co.uk",
     "ecb.europa.eu",
-    "www.ecb.europa.eu",
     "status.aave.com",
     "aave.com",
     "status.compound.finance",
@@ -28,25 +25,25 @@ ALLOWED_HOSTS = (
     "status.makerdao.com",
     "makerdao.com",
     "defillama.com",
-    "www.defillama.com",
     "coingecko.com",
-    "www.coingecko.com",
     "status.lido.fi",
     "lido.fi",
 )
 
 
-def _host(url: str) -> str:
-    return (urlparse(url).hostname or "").lower()
+def _canonical_host(url: str) -> str:
+    host = (urlparse(url).hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
 
 
 def _host_allowed(url: str) -> bool:
-    host = _host(url)
+    host = _canonical_host(url)
     if not host:
         return False
     for allowed in ALLOWED_HOSTS:
-        base = allowed[4:] if allowed.startswith("www.") else allowed
-        if host == allowed or host == base or host.endswith("." + base):
+        if host == allowed or host.endswith("." + allowed):
             return True
     return False
 
@@ -77,6 +74,10 @@ def _today_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+def _bool(value) -> bool:
+    return value is True
+
+
 @gl.evm.contract_interface
 class _Wallet:
     class View:
@@ -101,6 +102,8 @@ class RateLock:
     liquidator: Address
     collateral: u256
     threshold_bps: u256
+    rate_id: str
+    units: str
     window_start: str
     window_end: str
     grace_after: str
@@ -128,8 +131,17 @@ class PublicRateLock(gl.Contract):
             raise gl.vm.UserError("lock not found")
         return self.locks[lock_id]
 
-    def _extract_breach(self, url: str, threshold_bps: u256, window_start: str, window_end: str) -> dict:
-        failed = {"related": False, "date_match": False, "breached": False}
+    def _extract_breach(
+        self, url: str, threshold_bps: u256, rate_id: str, units: str,
+        window_start: str, window_end: str,
+    ) -> dict:
+        failed = {
+            "related": False,
+            "date_match": False,
+            "breached": False,
+            "rate_match": False,
+            "units_match": False,
+        }
         try:
             raw = gl.nondet.web.render(url, mode="text")
             page_text = raw if isinstance(raw, str) else str(raw)
@@ -138,8 +150,10 @@ class PublicRateLock(gl.Contract):
             return failed
 
         prompt = f"""
-Read one public rate or status page and decide if the rate breached the threshold inside the window.
+Read one public rate page and decide if it describes the named rate in the named units and whether that rate breached the threshold inside the window.
 
+Rate identifier: {rate_id}
+Units: {units}
 Threshold (basis points): {int(threshold_bps)}
 Window start (YYYY-MM-DD): {window_start}
 Window end (YYYY-MM-DD): {window_end}
@@ -148,15 +162,19 @@ Source URL: {url}
 Page text:
 {page_text}
 
-Return JSON only:
+Return JSON only with actual JSON booleans (true or false, not strings):
 {{
   "related": true or false,
   "date_match": true or false,
-  "breached": true or false
+  "breached": true or false,
+  "rate_match": true or false,
+  "units_match": true or false
 }}
 Rules:
-- related is true only if the page shows a rate or index that can be compared to the threshold.
-- date_match is true only if the breach (or the rate reading) falls inside the window.
+- related is true only if the page shows a rate or index.
+- rate_match is true only if the page describes the rate identifier above.
+- units_match is true only if the page describes the units above.
+- date_match is true only if the reading falls inside the window.
 - breached is true only if the page shows the rate at or above the threshold inside that window.
 """
         try:
@@ -167,18 +185,22 @@ Rules:
             return failed
 
         return {
-            "related": bool(parsed.get("related", False)),
-            "date_match": bool(parsed.get("date_match", False)),
-            "breached": bool(parsed.get("breached", False)),
+            "related": _bool(parsed.get("related")),
+            "date_match": _bool(parsed.get("date_match")),
+            "breached": _bool(parsed.get("breached")),
+            "rate_match": _bool(parsed.get("rate_match")),
+            "units_match": _bool(parsed.get("units_match")),
         }
 
     def _decision(self, lock: RateLock) -> dict:
         try:
             page_a = self._extract_breach(
-                lock.source_url_a, lock.threshold_bps, lock.window_start, lock.window_end
+                lock.source_url_a, lock.threshold_bps, lock.rate_id, lock.units,
+                lock.window_start, lock.window_end,
             )
             page_b = self._extract_breach(
-                lock.source_url_b, lock.threshold_bps, lock.window_start, lock.window_end
+                lock.source_url_b, lock.threshold_bps, lock.rate_id, lock.units,
+                lock.window_start, lock.window_end,
             )
         except Exception:
             return {"verdict": "UNKNOWN"}
@@ -190,6 +212,10 @@ Rules:
             or not page_b["date_match"]
             or not page_a["breached"]
             or not page_b["breached"]
+            or not page_a["rate_match"]
+            or not page_b["rate_match"]
+            or not page_a["units_match"]
+            or not page_b["units_match"]
         ):
             return {"verdict": "UNKNOWN"}
         return {"verdict": "BREACH"}
@@ -231,6 +257,8 @@ Rules:
     def open_lock(
         self,
         threshold_bps: u256,
+        rate_id: str,
+        units: str,
         window_start: str,
         window_end: str,
         source_url_a: str,
@@ -238,13 +266,17 @@ Rules:
     ) -> str:
         if threshold_bps == 0:
             raise gl.vm.UserError("threshold must be greater than zero")
+        cleaned_rate = rate_id.strip()
+        cleaned_units = units.strip()
+        if len(cleaned_rate) < MIN_TEXT_CHARS or len(cleaned_units) < MIN_TEXT_CHARS:
+            raise gl.vm.UserError("rate_id and units are required")
         window_start = _require_date(window_start, "window_start")
         window_end = _require_date(window_end, "window_end")
         if window_end < window_start:
             raise gl.vm.UserError("window_end must be on or after window_start")
         url_a = _require_https_url(source_url_a, "source_url_a")
         url_b = _require_https_url(source_url_b, "source_url_b")
-        if _host(url_a) == _host(url_b):
+        if _canonical_host(url_a) == _canonical_host(url_b):
             raise gl.vm.UserError("sources must come from two different hosts")
         collateral = gl.message.value
         if collateral == 0:
@@ -256,6 +288,8 @@ Rules:
             liquidator=ZERO,
             collateral=collateral,
             threshold_bps=threshold_bps,
+            rate_id=cleaned_rate,
+            units=cleaned_units,
             window_start=window_start,
             window_end=window_end,
             grace_after=_add_days(window_end, GRACE_DAYS),
@@ -304,7 +338,6 @@ Rules:
         today = _today_utc()
         if today < lock.grace_after:
             raise gl.vm.UserError("close_expired cannot run before grace_after " + lock.grace_after)
-        # Recovery: second host never confirmed, collateral returns to borrower
         collateral = lock.collateral
         borrower = lock.borrower
         lock.status = "CLOSED"
@@ -340,6 +373,8 @@ Rules:
                 "liquidator": lock.liquidator.as_hex,
                 "collateral": str(int(lock.collateral)),
                 "threshold_bps": str(int(lock.threshold_bps)),
+                "rate_id": lock.rate_id,
+                "units": lock.units,
                 "window_start": lock.window_start,
                 "window_end": lock.window_end,
                 "grace_after": lock.grace_after,
